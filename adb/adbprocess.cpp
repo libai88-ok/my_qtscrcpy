@@ -103,6 +103,7 @@ void AdbProcess::push(const QString &serial, const QString &local, const QString
     adbArgs << "push";
     adbArgs << local;
     adbArgs << remote;
+    //qDebug() << adbArgs.join(" ");
     execute(serial, adbArgs);
 }
 

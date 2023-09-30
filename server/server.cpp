@@ -3,14 +3,32 @@
 #include <QCoreApplication>
 #include <QFileInfo>
 //#include <QtDebug>
-
-#define DEVICE_SERVER_PATH "/data/lcoal/tmp/scrcpy-server.jar"
+#include <QSize>
+#define DEVICE_SERVER_PATH "/data/local/tmp/scrcpy-server.jar"
 #define SOCKET_NAME "scrcpy"
 
 server::server(QObject *parent)
     :QObject(parent)
 {
     connect(&m_workProcess, &AdbProcess::adbProcessResult, this, &server::onWorkProcessResult);
+    connect(&m_serverProcess, &AdbProcess::adbProcessResult, this, &server::onWorkProcessResult);
+    connect(&m_serverSocket, &QTcpServer::newConnection, this,[this](){
+        m_deviceSocket = m_serverSocket.nextPendingConnection();
+
+        QString deviceName;
+        QSize size;
+        //socket接收第一条信息包含device name与size
+        if (m_deviceSocket && m_deviceSocket->isValid()) {
+            //socket建立成功那么就可以关闭反向代理
+            disableTunnelReverse();
+            //安卓会对jar加标记，等到jar执行结束再删除
+            removeServer();
+            emit connectToResult(true, deviceName, size);
+        } else {
+            stop();
+            emit connectToResult(false, deviceName, size);
+        }
+    });
 }
 
 /*
@@ -32,37 +50,75 @@ bool server::start(const QString &serial, quint16 localPort, quint16 maxSize, qu
     return startServerByStep();
 }
 
+void server::stop()
+{
+    if (m_deviceSocket) {
+        m_deviceSocket->close();
+        //不需要手动删除，因为这个指针是调用parent中函数获取的，它的析构由parent负责
+        //m_deviceSocket->deleteLater();
+    }
+    m_serverProcess.kill();
+    disableTunnelReverse();
+    removeServer();
+    m_serverSocket.close();
+}
+
 //根据adbprocess中信号进行跳转
 void server::onWorkProcessResult(AdbProcess::ADB_PROCESS_RESULT processResult)
 {
-    if (m_serverStartStep != SSS_NULL) {
-        switch (m_serverStartStep) {
-        case SSS_PUSH:
-            if (processResult == AdbProcess::AER_SUCCESS_EXEC) {
-                m_serverStartStep = SSS_ENABLE_REVERSE;
-                startServerByStep();
-            } else {
-                qCritical() << "adb push failed!";
-                m_serverStartStep = SSS_NULL;
-                emit serverStartResult(false);
-            }
-            break;
-        case SSS_ENABLE_REVERSE:
-            if (processResult == AdbProcess::AER_SUCCESS_EXEC) {
-                m_serverStartStep = SSS_EXECUTE_SERVER;
-                startServerByStep();
-            } else {
-                qCritical() << "adb reverse failed!";
-                m_serverStartStep = SSS_NULL;
-                //这里失败处理不同，因为上一步失败只需报错，这一步失败需要将上一步push的删除
+    if (sender() == &m_workProcess) {
+        if (m_serverStartStep != SSS_NULL) {
+            switch (m_serverStartStep) {
+            case SSS_PUSH:
+                if (processResult == AdbProcess::AER_SUCCESS_EXEC) {
+                    m_serverStartStep = SSS_ENABLE_REVERSE;
+                    m_serverCopiedToDevice = true;
+                    startServerByStep();
+                } else if (processResult == AdbProcess::AER_ERROR_EXEC || processResult == AdbProcess::AER_ERROR_MISSING_BINARY ||processResult == AdbProcess::AER_ERROR_START){
+                    qCritical() << "adb push failed!";
+                    m_serverStartStep = SSS_NULL;
+                    emit serverStartResult(false);
+                }
+                break;
+            case SSS_ENABLE_REVERSE:
+                if (processResult == AdbProcess::AER_SUCCESS_EXEC) {
+                    m_serverStartStep = SSS_EXECUTE_SERVER;
+                    m_enableReverse = true;
+                    startServerByStep();
+                } else if(processResult == AdbProcess::AER_ERROR_EXEC || processResult == AdbProcess::AER_ERROR_MISSING_BINARY ||processResult == AdbProcess::AER_ERROR_START){
+                    qCritical() << "adb reverse failed!";
+                    m_serverStartStep = SSS_NULL;
+                    //这里失败处理不同，因为上一步失败只需报错，这一步失败需要将上一步push的删除
+                    removeServer();
+                    emit serverStartResult(false);
+                }
+                break;
+            case SSS_EXECUTE_SERVER:
 
-                emit serverStartResult(false);
+                break;
+            default:
+                break;
             }
-            break;
-        default:
-            break;
         }
     }
+
+    if (sender() == &m_serverProcess) {
+        if (SSS_EXECUTE_SERVER == m_serverStartStep) {
+            //因为这里的adb shell是阻塞的，所以只判断是否启动成功，而不是成功执行
+            if (processResult == AdbProcess::AER_SUCCESS_START) {
+                m_serverStartStep = SSS_RUNNING;
+                emit serverStartResult(true);
+            }
+            else if (processResult == AdbProcess::AER_ERROR_START){
+                qCritical() << "adb shell start server failed!";
+                m_serverStartStep = SSS_NULL;
+                disableTunnelReverse();
+                removeServer();
+                emit serverStartResult(false);
+            }
+        }
+    }
+
 }
 
 //根据状态变量，设置一个状态机，然后一步步执行
@@ -80,7 +136,17 @@ bool server::startServerByStep()
             stepSuccess = enableTunnelReverse();
             break;
         case SSS_EXECUTE_SERVER:
-
+            //PC端监听本地端口
+            m_serverSocket.setMaxPendingConnections(1);
+            if (!m_serverSocket.listen(QHostAddress::LocalHost, m_localPort)) {
+                qCritical() << QString("Could not listen on port %1").arg(m_localPort);
+                m_serverStartStep = SSS_NULL;
+                disableTunnelReverse();
+                removeServer();
+                emit serverStartResult(false);
+                return false;
+            }
+            stepSuccess = execute();
             break;
         case SSS_RUNNING:
 
@@ -101,6 +167,10 @@ bool server::pushServer()
 //这里不关心remove的处理结果，所以最好不适用m_workProcess处理流程
 bool server::removeServer()
 {
+    if (!m_serverCopiedToDevice) {
+        return true;
+    }
+    m_serverCopiedToDevice = false;
     AdbProcess * thisProcess = new AdbProcess();
     if (!thisProcess) {
         return false;
@@ -118,6 +188,45 @@ bool server::removeServer()
 bool server::enableTunnelReverse()
 {
     m_workProcess.reverse(m_serial, SOCKET_NAME, m_localPort);
+    return true;
+}
+
+//adb shell CLASSPATH=/data/local/tmp/scrcpy-server.jar app_process / com.genymobile.scrcpy.Server maxsize bitrate false ""
+//adb shell命令 启动这个jar文件中 斜杠后jar中这个类的main函数，启动scrcpy-server；
+//后接参数，最大尺寸:0是默认，1080better、比特率8000000、是否正向连接（反向false）、是否对画面进行剪切（不剪切设为空）
+bool server::execute()
+{
+    QStringList args;
+    args << "shell";
+    args << QString("CLASSPATH=%1").arg(DEVICE_SERVER_PATH);
+    args << "app_process";
+    args << "/";
+    args << "com.genymobile.scrcpy.Server";
+    args << QString::number(m_maxSize);
+    args << QString::number(m_bitRate);
+    args << "false";
+    args << "";
+    m_serverProcess.execute(m_serial,args);
+    return true;
+}
+
+bool server::disableTunnelReverse()
+{
+    if (!m_enableReverse) {
+        return true;
+    }
+    m_enableReverse = false;
+    AdbProcess * thisProcess = new AdbProcess();
+    if (!thisProcess) {
+        return false;
+    }
+    connect(thisProcess, &AdbProcess::adbProcessResult, this, [this](AdbProcess::ADB_PROCESS_RESULT processResult){
+        if (processResult != AdbProcess::AER_SUCCESS_START) {
+            //sender() 返回发送信号的对象的指针，调用deleteLater，
+            sender()->deleteLater();
+        }
+    });
+    thisProcess->reverseRemove(m_serial, SOCKET_NAME);
     return true;
 }
 

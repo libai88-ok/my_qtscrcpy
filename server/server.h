@@ -2,11 +2,10 @@
 #define SERVER_H
 
 #include <QObject>
-#include "../adb/adbprocess.h"
+#include <QTcpServer>
+#include <QTcpSocket>
 
-//adb shell /data/local/tmp/scrcpy-server.jar app_process / com.genymobile.scrcpy.Server maxsize bitrate false ""
-//adb shell命令 启动这个jar文件中 斜杠后jar中这个类的main函数，启动scrcpy-server；
-//后接参数，最大尺寸:0是默认，1080better、比特率8000000、是否正向连接（反向false）、是否对画面进行剪切（不剪切设为空）
+#include "../adb/adbprocess.h"
 
 class server : public QObject
 {
@@ -24,10 +23,10 @@ public:
     server(QObject *parent = nullptr);
 
     bool start(const QString & serial, quint16 localPort, quint16 maxSize, quint16 bitRate);
-
+    void stop();
 signals:
     void serverStartResult(bool success);
-
+    void connectToResult(bool success, const QString & deviceName, const QSize & size);
 private slots:
     void onWorkProcessResult(AdbProcess::ADB_PROCESS_RESULT processResult);
 
@@ -36,6 +35,9 @@ private:
     bool pushServer();
     bool removeServer();
     bool enableTunnelReverse();
+    bool execute();
+    bool disableTunnelReverse();
+
     QString getServerPath();
 
 private:
@@ -47,8 +49,15 @@ private:
     SERVER_START_STEP m_serverStartStep = SSS_NULL;
 
     AdbProcess m_workProcess;
+    AdbProcess m_serverProcess;
 
     QString m_serverPath;
+
+    bool m_serverCopiedToDevice = false;
+    bool m_enableReverse = false;
+
+    QTcpServer m_serverSocket;
+    QTcpSocket * m_deviceSocket = nullptr;
 };
 
 #endif // SERVER_H
