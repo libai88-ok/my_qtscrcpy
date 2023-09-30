@@ -4,8 +4,10 @@
 #include <QFileInfo>
 //#include <QtDebug>
 #include <QSize>
+
 #define DEVICE_SERVER_PATH "/data/local/tmp/scrcpy-server.jar"
 #define SOCKET_NAME "scrcpy"
+#define DEVICE_NAME_FIELD_LENGTH 64
 
 server::server(QObject *parent)
     :QObject(parent)
@@ -18,7 +20,7 @@ server::server(QObject *parent)
         QString deviceName;
         QSize size;
         //socket接收第一条信息包含device name与size
-        if (m_deviceSocket && m_deviceSocket->isValid()) {
+        if (m_deviceSocket && m_deviceSocket->isValid() && readInfo(deviceName, size)) {
             //socket建立成功那么就可以关闭反向代理
             disableTunnelReverse();
             //安卓会对jar加标记，等到jar执行结束再删除
@@ -249,4 +251,25 @@ QString server::getServerPath()
         }
     }
     return m_serverPath;
+}
+
+bool server::readInfo(QString &deviceName, QSize &size)
+{
+    //64bit 设备名称 2b 宽 2b高
+    unsigned char buf[DEVICE_NAME_FIELD_LENGTH + 4];
+    //如果socket中b小于64那么等待300毫秒
+    if (m_deviceSocket->bytesAvailable() <= DEVICE_NAME_FIELD_LENGTH + 4) {
+        m_deviceSocket->waitForReadyRead(300);
+        //return false;
+    }
+    qint64 len = m_deviceSocket->read((char *)buf, sizeof(buf));
+    if (len < DEVICE_NAME_FIELD_LENGTH + 4) {
+        qInfo() << "Could not retrieve device infomation";
+        return false;
+    }
+    buf[DEVICE_NAME_FIELD_LENGTH-1] = '\0';
+    deviceName = (char *) buf;
+    size.setWidth((buf[DEVICE_NAME_FIELD_LENGTH] << 8) | buf[DEVICE_NAME_FIELD_LENGTH+1]);
+    size.setHeight((buf[DEVICE_NAME_FIELD_LENGTH+2] << 8) | buf[DEVICE_NAME_FIELD_LENGTH+3]);
+    return true;
 }

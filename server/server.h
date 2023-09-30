@@ -58,6 +58,7 @@ private:
 
     QTcpServer m_serverSocket;
     QTcpSocket * m_deviceSocket = nullptr;
+    bool readInfo(QString & deviceName, QSize & size);
 };
 
 #endif // SERVER_H

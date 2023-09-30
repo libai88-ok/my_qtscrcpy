@@ -12,7 +12,7 @@ Dialog::Dialog(QWidget *parent)
         qDebug() << "server start" << success;
     });
     connect(&m_server, &server::connectToResult, [this](bool success, const QString & deviceName, const QSize & size) {
-        qDebug() << "server connection" << success;
+        qDebug() << "server connection" << success << "devicename:" << deviceName << "size_w:" <<size.width() << "size_h:" << size.height();
     });
 }
 
